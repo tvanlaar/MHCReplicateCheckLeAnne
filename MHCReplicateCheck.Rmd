@@ -1,0 +1,315 @@
+---
+title: "MHC Replicate Check"
+author: "Tricia"
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+##Load required packages
+```{r warning=FALSE, message=FALSE}
+library(dada2)
+library(Biostrings)
+library(ShortRead)
+library(MHCtools)
+library(ggplot2)
+library(phyloseq)
+```
+
+##Provide path to sequences
+```{r}
+path <- "./sequences"
+list.files(path)
+```
+
+##Import file names and make matched list
+```{r}
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+##
+```{r}
+names(fnFs) <- sample.names
+names(fnRs) <- sample.names
+
+fwd_primer <- "CSCSCAGGTCTSCACAC"
+rev_primer <- "CWCARKAATTCTGYTCHCACC"
+fwd_primer_rev <- as.character(reverseComplement(DNAStringSet(fwd_primer)))
+rev_primer_rev <- as.character(reverseComplement(DNAStringSet(rev_primer)))
+```
+
+# This function counts number of reads in which the primer is found
+```{r}
+count_primers <- function(primer, filename) {
+  num_hits <- vcountPattern(primer, sread(readFastq(filename)), fixed = FALSE)
+  return(sum(num_hits > 0))
+}
+
+count_primers(fwd_primer, fnFs[[1]])
+count_primers(rev_primer, fnRs[[1]])
+```
+
+# CHANGE ME to the cutadapt path 
+```{r}
+cutadapt <- path.expand("~/miniforge3/bin/cutadapt")
+
+# Make sure it works
+system2(cutadapt, args = "--version")
+```
+
+# Remove primers using cutadapt
+```{r}
+# Create an output directory to store the clipped files
+cut_dir <- file.path(path, "cutadapt")
+if (!dir.exists(cut_dir)) dir.create(cut_dir)
+
+fwd_cut <- file.path(cut_dir, basename(fnFs))
+rev_cut <- file.path(cut_dir, basename(fnRs))
+
+names(fwd_cut) <- sample.names
+names(rev_cut) <- sample.names
+
+# It's good practice to keep some log files so let's create some
+# file names that we can use for those 
+cut_logs <- path.expand(file.path(cut_dir, paste0(sample.names, ".log")))
+
+# m flag necessary because 0 length reads were retained
+cutadapt_args <- c("-g", fwd_primer, "-a", rev_primer_rev, 
+                   "-G", rev_primer, "-A", fwd_primer_rev,
+                   "-n", 2, "--discard-untrimmed", "-m", 20)
+
+# Loop over the list of files, running cutadapt on each file.  If you don't have a vector of sample names or 
+# don't want to keep the log files you can set stdout = "" to output to the console or stdout = NULL to discard
+for (i in seq_along(fnFs)) {
+  system2(cutadapt, 
+          args = c(cutadapt_args,
+                   "-o", fwd_cut[i], "-p", rev_cut[i], 
+                   fnFs[i], fnRs[i]),
+          stdout = cut_logs[i])  
+}
+
+# quick check that we got something
+head(list.files(cut_dir))
+```
+
+##Inspect forward read quality
+```{r}
+plotQualityProfile(fwd_cut[1:2])
+```
+
+##Inspect reverse read quality
+```{r}
+plotQualityProfile(rev_cut[1:2])
+```
+
+##Assign file names for filtered reads
+```{r}
+# Place filtered files in filtered/ subdirectory
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+# Read in repl_table
+```{r}
+repl_table <- read.csv("repl_table.csv")
+```
+
+
+# Loop through different truncQ values
+```{r}
+# Define truncQ values to test
+truncQ_values <- seq(18, 30, by=2)
+
+# Initialize results storage
+results_truncQ <- data.frame(truncQ = numeric(), repeatability = numeric())
+
+# Loop through truncQ values
+for (truncQ in truncQ_values) {
+  cat("Testing truncQ =", truncQ, "\n")
+  
+  # Filter reads
+  out <- filterAndTrim(fwd_cut, filtFs, rev_cut, filtRs,
+                       maxN = 0, maxEE = c(2, 2), truncQ = truncQ, rm.phix = TRUE,
+                       compress = TRUE, multithread = TRUE)
+  
+  # Learn error rates
+  errF <- learnErrors(filtFs, multithread = TRUE)
+  errR <- learnErrors(filtRs, multithread = TRUE)
+  
+  # Dereplicate
+  derepFs <- derepFastq(filtFs)
+  derepRs <- derepFastq(filtRs)
+  names(derepFs) <- sample.names
+  names(derepRs) <- sample.names
+  
+  # Sample inference
+  dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+  dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+  
+  # Merge paired reads
+  mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = TRUE)
+  
+  # Construct sequence table
+  seqtab <- makeSequenceTable(mergers)
+  
+  # Remove chimeras
+  seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+  
+  # Run ReplMatch
+  dir.create("replmatch", showWarnings = FALSE)
+  ReplMatch(repl_table = repl_table, seq_table = seqtab.nochim, path_out = "replmatch")
+  
+  # Get repeatability stats
+  repl_stats <- GetReplStats("replmatch")
+  
+  # Calculate repeatability
+  repeatability <- repl_stats$Repeatability
+  
+  # Store results
+  results_truncQ <- rbind(results_truncQ, data.frame(truncQ = truncQ, repeatability = repeatability))
+}
+
+# Print results
+print(results_truncQ)
+```
+
+```{r}
+# Optionally, visualize results
+truncQ_graph <- ggplot(results_truncQ, aes(x = truncQ, y = repeatability)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Repeatability vs. truncQ", x = "truncQ", y = "Repeatability") +
+  theme_minimal()
+
+# Save the plot
+ggsave(filename = "Repeatability_vs_truncQ.png", 
+       plot = truncQ_graph, 
+       width = 6, 
+       height = 4, 
+       dpi = 300)
+```
+
+# Loop through maxEE with truncQ at 24 from above
+```{r}
+# Define maxEE values to test
+maxEE_values <- seq(0.1, 2, by=0.1)
+
+# Initialize results storage
+results_maxEE <- data.frame(maxEE = numeric(), repeatability = numeric())
+
+# Loop through maxEE values
+for (maxEE in maxEE_values) {
+  cat("Testing maxEE =", maxEE, "\n")
+  
+  # Filter reads
+  out <- filterAndTrim(fwd_cut, filtFs, rev_cut, filtRs,
+                       maxN = 0, maxEE = c(maxEE, maxEE), truncQ = 24, rm.phix = TRUE,
+                       compress = TRUE, multithread = TRUE)
+  
+  # Learn error rates
+  errF <- learnErrors(filtFs, multithread = TRUE)
+  errR <- learnErrors(filtRs, multithread = TRUE)
+  
+  # Dereplicate
+  derepFs <- derepFastq(filtFs)
+  derepRs <- derepFastq(filtRs)
+  names(derepFs) <- sample.names
+  names(derepRs) <- sample.names
+  
+  # Sample inference
+  dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+  dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+  
+  # Merge paired reads
+  mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = TRUE)
+  
+  # Construct sequence table
+  seqtab <- makeSequenceTable(mergers)
+  
+  # Remove chimeras
+  seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+  
+  # Run ReplMatch
+  dir.create("replmatch", showWarnings = FALSE)
+  ReplMatch(repl_table = repl_table, seq_table = seqtab.nochim, path_out = "replmatch")
+  
+  # Get repeatability stats
+  repl_stats <- GetReplStats("replmatch")
+  
+  # Calculate repeatability
+  repeatability <- repl_stats$Repeatability
+  
+  # Store results
+  results_maxEE <- rbind(results_maxEE, data.frame(maxEE = maxEE, repeatability = repeatability))
+}
+
+# Print results
+print(results_maxEE)
+
+# Optionally, visualize results
+library(ggplot2)
+maxEE_graph <- ggplot(results_maxEE, aes(x = maxEE, y = repeatability)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Repeatability vs. maxEE", x = "maxEE", y = "Repeatability") +
+  theme_minimal()
+```
+
+```{r}
+ggsave(filename = "Repeatability_vs_maxEE.png", 
+       plot = maxEE_graph, 
+       width = 6, 
+       height = 4, 
+       dpi = 300)
+```
+
+# Final filtration with optimum settings
+```{r}
+# Filter reads
+  out <- filterAndTrim(fwd_cut, filtFs, rev_cut, filtRs,
+                       maxN = 0, maxEE = c(2, 2), truncQ = 24, rm.phix = TRUE,
+                       compress = TRUE, multithread = TRUE)
+  
+  # Learn error rates
+  errF <- learnErrors(filtFs, multithread = TRUE)
+  errR <- learnErrors(filtRs, multithread = TRUE)
+  
+  # Dereplicate
+  derepFs <- derepFastq(filtFs)
+  derepRs <- derepFastq(filtRs)
+  names(derepFs) <- sample.names
+  names(derepRs) <- sample.names
+  
+  # Sample inference
+  dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+  dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+  
+  # Merge paired reads
+  mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = TRUE)
+  
+  # Construct sequence table
+  seqtab <- makeSequenceTable(mergers)
+  
+  # Remove chimeras
+  seqtab.nochim <- removeBimeraDenovo(seqtab, method = "consensus", multithread = TRUE, verbose = TRUE)
+```
+
+##Save seqtab.nochim as an R file
+```{r}
+save(seqtab.nochim, file="../RData/seqtab.nochim.RData")
+```
+
+##Track reads through pipeline
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+```
